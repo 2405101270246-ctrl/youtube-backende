@@ -8,6 +8,11 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// Root endpoint for health check
+app.get('/', (req, res) => {
+    res.json({ status: 'ok', message: 'TubeSync Scraping Backend is running!' });
+});
+
 // In-memory cache
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
