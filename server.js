@@ -195,33 +195,49 @@ function parseCountText(text) {
 
 // Scrape videos of a specific tab from HTML using ytInitialData JSON
 async function fetchChannelVideosTab(channelId, tabName, type) {
-    const url = `https://www.youtube.com/channel/${channelId}/${tabName}`;
-    console.log(`Fetching videos tab: ${url}`);
-    try {
-        const response = await axiosGetWithRetry(
-            url,
-            {
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-                    'Accept-Language': 'en-US,en;q=0.9'
+    // Try both canonical and fallback paths (YouTube can change routing)
+    const urls = [
+        `https://www.youtube.com/channel/${channelId}/${tabName}`,
+        `https://www.youtube.com/${tabName}?channel_id=${channelId}`,
+        `https://www.youtube.com/channel/${channelId}/${tabName}?view=0&sort=dd` // may help
+    ];
+
+    console.log(`Fetching videos tab: ${urls[0]}`);
+
+    for (const url of urls) {
+        try {
+            const response = await axiosGetWithRetry(
+                url,
+                {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+                        'Accept-Language': 'en-US,en;q=0.9'
+                    },
+                    maxRedirects: 5
                 },
-                maxRedirects: 5
-            },
-            2,
-            HTTP_TIMEOUT_MS,
-            500
-        );
-        return extractVideosFromHtml(response.data, type);
-    } catch (e) {
-        console.error(`Failed to fetch tab ${tabName}:`, e.message);
-        return [];
+                2,
+                HTTP_TIMEOUT_MS,
+                500
+            );
+            return extractVideosFromHtml(response.data, type);
+        } catch (e) {
+            lastError = e;
+            console.error(`Failed to fetch tab ${tabName} from ${url}:`, e.message);
+        }
     }
+
+    if (lastError) {
+        console.error(`All fetch attempts failed for tab ${tabName}:`, lastError.message);
+    }
+    return [];
 }
+
 
 
 function extractVideosFromHtml(html, type) {
     const videos = [];
-    const match = html.match(/var ytInitialData = ({.*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({.*?});/);
+    const match = html.match(/var ytInitialData = ({.*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({.*?});/) || html.match(/ytInitialData\s*=\s*({.*?});<\/script>/);
+
     if (!match) return videos;
 
     try {
