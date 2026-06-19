@@ -204,6 +204,13 @@ async function fetchChannelVideosTab(channelId, tabName, type) {
 
     console.log(`Fetching videos tab: ${urls[0]}`);
 
+    // Limitation: ytInitialData HTML me usually limited items hote hain.
+    // 2 weeks ke total ke liye proper approach: pagination/continuation ya API.
+    // Is current blackbox scrapper me best effort: zyada items tab se le kar then filter.
+    const MAX_ITEMS_PER_TAB = Number(process.env.MAX_ITEMS_PER_TAB || 200);
+
+    let lastError;
+
     for (const url of urls) {
         try {
             const response = await axiosGetWithRetry(
@@ -211,7 +218,8 @@ async function fetchChannelVideosTab(channelId, tabName, type) {
                 {
                     headers: {
                         'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-                        'Accept-Language': 'en-US,en;q=0.9'
+                        'Accept-Language': 'en-US,en;q=0.9',
+                        'Accept': 'text/html,application/xhtml+xml'
                     },
                     maxRedirects: 5
                 },
@@ -219,7 +227,10 @@ async function fetchChannelVideosTab(channelId, tabName, type) {
                 HTTP_TIMEOUT_MS,
                 500
             );
-            return extractVideosFromHtml(response.data, type);
+            const videos = extractVideosFromHtml(response.data, type);
+            if (videos && videos.length > 0) {
+                return videos.slice(0, MAX_ITEMS_PER_TAB);
+            }
         } catch (e) {
             lastError = e;
             console.error(`Failed to fetch tab ${tabName} from ${url}:`, e.message);
@@ -229,50 +240,74 @@ async function fetchChannelVideosTab(channelId, tabName, type) {
     if (lastError) {
         console.error(`All fetch attempts failed for tab ${tabName}:`, lastError.message);
     }
+
     return [];
 }
 
 
 
+
+
 function extractVideosFromHtml(html, type) {
     const videos = [];
-    const match = html.match(/var ytInitialData = ({.*?});<\/script>/) || html.match(/window\["ytInitialData"\] = ({.*?});/) || html.match(/ytInitialData\s*=\s*({.*?});<\/script>/);
+
+    const match =
+        html.match(/var ytInitialData = ([\s\S]*?);<\/script>/) ||
+        html.match(/window\["ytInitialData"\] = ([\s\S]*?);/) ||
+        html.match(/ytInitialData\s*=\s*([\s\S]*?);<\/script>/) ||
+        html.match(/"ytInitialData"\s*:\s*({[\s\S]*?})/);
 
     if (!match) return videos;
 
+    let data;
     try {
-        const data = JSON.parse(match[1]);
+        data = JSON.parse(match[1]);
+
         const videoRenderers = findObjectsWithKey(data, 'videoRenderer');
         const gridVideoRenderers = findObjectsWithKey(data, 'gridVideoRenderer');
         const richItemRenderers = findObjectsWithKey(data, 'richItemRenderer');
-        
+
         const renderers = [...videoRenderers, ...gridVideoRenderers];
-        
-        // Match rich items (typical for grid/shorts/streams)
+
+        // Shorts renderers sometimes come via shortsLockupRenderer
         for (const rich of richItemRenderers) {
             if (rich.content && rich.content.videoRenderer) {
                 renderers.push(rich.content.videoRenderer);
             }
             if (rich.content && rich.content.shortsLockupRenderer) {
                 const short = rich.content.shortsLockupRenderer;
-                const videoId = short.entityId || (short.navigationEndpoint && short.navigationEndpoint.reelWatchEndpoint && short.navigationEndpoint.reelWatchEndpoint.videoId);
+                const videoId =
+                    short.entityId ||
+                    (short.navigationEndpoint &&
+                        short.navigationEndpoint.reelWatchEndpoint &&
+                        short.navigationEndpoint.reelWatchEndpoint.videoId);
+
                 if (videoId) {
                     videos.push({
                         videoId,
-                        title: short.headline && short.headline.simpleText || 'Short Video',
+                        title: (short.headline && short.headline.simpleText) || 'Short Video',
                         description: '',
-                        thumbnailUrl: short.thumbnail && short.thumbnail.thumbnails && short.thumbnail.thumbnails[0].url || '',
+                        thumbnailUrl:
+                            short.thumbnail &&
+                            short.thumbnail.thumbnails &&
+                            short.thumbnail.thumbnails[0] &&
+                            short.thumbnail.thumbnails[0].url
+                                ? short.thumbnail.thumbnails[0].url
+                                : '',
                         videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
                         videoType: 'SHORTS',
-                        duration: 30000, // 30s
-                        views: parseViewsToLong(short.viewCountText && short.viewCountText.simpleText),
+                        duration: 30000,
+                        views: parseViewsToLong(
+                            short.viewCountText && short.viewCountText.simpleText
+                        ),
                         publishedAt: Date.now()
                     });
                 }
             }
         }
 
-        const seen = new Set();
+        // dedupe across all sources
+        const seen = new Set(videos.map(v => v.videoId));
 
         for (const r of renderers) {
             const videoId = r.videoId;
@@ -280,9 +315,11 @@ function extractVideosFromHtml(html, type) {
             if (seen.has(videoId)) continue;
             seen.add(videoId);
 
+            const title =
+                (r.title && r.title.runs && r.title.runs[0] && r.title.runs[0].text) ||
+                (r.title && r.title.simpleText) ||
+                'Video';
 
-            const title = r.title && r.title.runs && r.title.runs[0] && r.title.runs[0].text || r.title && r.title.simpleText || 'Video';
-            
             let description = '';
             if (r.descriptionSnippet && r.descriptionSnippet.runs && r.descriptionSnippet.runs[0]) {
                 description = r.descriptionSnippet.runs[0].text;
@@ -293,14 +330,25 @@ function extractVideosFromHtml(html, type) {
                 thumbnailUrl = r.thumbnail.thumbnails[r.thumbnail.thumbnails.length - 1].url;
             }
 
-            const viewsStr = r.viewCountText && r.viewCountText.simpleText || r.viewCountText && r.viewCountText.runs && r.viewCountText.runs[0] && r.viewCountText.runs[0].text || '';
+            const viewsStr =
+                (r.viewCountText && r.viewCountText.simpleText) ||
+                (r.viewCountText &&
+                    r.viewCountText.runs &&
+                    r.viewCountText.runs[0] &&
+                    r.viewCountText.runs[0].text) ||
+                '';
+
             const views = parseViewsToLong(viewsStr);
 
-            const durationStr = r.lengthText && r.lengthText.simpleText || r.lengthText && r.lengthText.runs && r.lengthText.runs[0] && r.lengthText.runs[0].text || '';
+            const durationStr =
+                (r.lengthText && r.lengthText.simpleText) ||
+                (r.lengthText && r.lengthText.runs && r.lengthText.runs[0] && r.lengthText.runs[0].text) ||
+                '';
+
             const duration = parseDurationToMs(durationStr);
 
             let publishedAt = Date.now();
-            const pubText = r.publishedTimeText && r.publishedTimeText.simpleText || '';
+            const pubText = (r.publishedTimeText && r.publishedTimeText.simpleText) || '';
             if (pubText) {
                 publishedAt = parseRelativeTime(pubText);
             }
@@ -320,8 +368,10 @@ function extractVideosFromHtml(html, type) {
     } catch (e) {
         console.error('Error parsing ytInitialData:', e.message);
     }
+
     return videos;
 }
+
 
 function findObjectsWithKey(obj, key, results = []) {
     if (!obj || typeof obj !== 'object') return results;
@@ -506,6 +556,7 @@ function getFallbackVideosList(channelId, prefix) {
 // Endpoint: GET /api/scan
 app.get('/api/scan', async (req, res) => {
     const { url } = req.query;
+
     if (!url) {
         return res.status(400).json({ error: 'URL query parameter is required' });
     }
@@ -544,7 +595,27 @@ app.get('/api/scan', async (req, res) => {
             fetchChannelVideosTab(channelInfo.channelId, 'streams', 'LIVE')
         ]);
 
-        const videos = [...videosTab, ...shortsTab, ...streamsTab];
+        // Merge + normalize types properly
+        // Important: tabs (VIDEOS/SHORTS/LIVE) ko type ka source maan ke chalna hai.
+        // Shorts page me kabhi-kabhi normal videos ka data aa jata hai; isliye dedupe + type enforcement zaroori hai.
+        const videos = [...videosTab, ...shortsTab, ...streamsTab]
+            .filter(v => v && v.videoId && typeof v.videoUrl === 'string');
+
+        // Enforce type strictly based on tab: if extractor returned wrong type, override by array source.
+        // We tag items coming from each tab by setting videoType if missing.
+        // (Extractor should set it, but this guards against missing renderer metadata.)
+        for (const v of videosTab) v.videoType = 'VIDEOS';
+        for (const v of shortsTab) v.videoType = 'SHORTS';
+        for (const v of streamsTab) v.videoType = 'LIVE';
+
+
+            // Fix misclassification: rely strictly on tab-based type returned by extractVideosFromHtml(type).
+            // If v.videoType is missing for some reason, default it to VIDEOS.
+            for (const v of videos) {
+                if (!v.videoType) v.videoType = 'VIDEOS';
+            }
+
+
 
         // 3. Fallback to RSS if HTML tabs parsing was blocked
         if (videos.length === 0) {
